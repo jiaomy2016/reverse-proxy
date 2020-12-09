@@ -17,22 +17,7 @@ namespace Microsoft.ReverseProxy.Service.RuntimeModel.Transforms
         /// </summary>
         public HttpContext HttpContext { get; set; }
 
-        /// <summary>
-        /// The HTTP version to use for the proxy request.
-        /// </summary>
-        public Version Version { get; set; }
-
-#if NET
-        /// <summary>
-        /// The HTTP version policy to use for the proxy request.
-        /// </summary>
-        public HttpVersionPolicy VersionPolicy { get; set; }
-#endif
-
-        /// <summary>
-        /// The HTTP method to use for the proxy request.
-        /// </summary>
-        public string Method { get; set; }
+        public HttpRequestMessage Request { get; internal set; }
 
         /// <summary>
         /// The path to use for the proxy request.

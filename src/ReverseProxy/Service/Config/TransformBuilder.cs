@@ -3,11 +3,18 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Extensions;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Routing.Template;
-using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Primitives;
 using Microsoft.Net.Http.Headers;
+using Microsoft.ReverseProxy.Service.Proxy;
 using Microsoft.ReverseProxy.Service.RuntimeModel.Transforms;
 using Microsoft.ReverseProxy.Utilities;
 
@@ -18,6 +25,11 @@ namespace Microsoft.ReverseProxy.Service.Config
     /// </summary>
     internal class TransformBuilder : ITransformBuilder
     {
+        private static readonly HashSet<string> _responseHeadersToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            HeaderNames.TransferEncoding
+        };
+
         private readonly TemplateBinderFactory _binderFactory;
         private readonly IRandomFactory _randomFactory;
 
@@ -247,7 +259,13 @@ namespace Microsoft.ReverseProxy.Service.Config
         }
 
         /// <inheritdoc/>
-        public Transforms Build(IList<IDictionary<string, string>> rawTransforms)
+        public HttpTransforms Build(IList<IDictionary<string, string>> rawTransforms)
+        {
+            var transfomrs = BuildInternal(rawTransforms);
+            return AdaptTransforms(transfomrs);
+        }
+
+        internal Transforms BuildInternal(IList<IDictionary<string, string>> rawTransforms)
         {
             bool? copyRequestHeaders = null;
             bool? useOriginalHost = null;
@@ -563,6 +581,26 @@ namespace Microsoft.ReverseProxy.Service.Config
             return new Transforms(copyRequestHeaders, requestTransforms, requestHeaderTransforms, responseHeaderTransforms, responseTrailerTransforms);
         }
 
+        private HttpTransforms AdaptTransforms(Transforms tranforms)
+        {
+            return new HttpTransforms()
+            {
+                // Use the default copy logic only if we don't have any transforms.
+                CopyRequestHeaders = tranforms.RequestHeaderTransforms.Count == 0 && (tranforms.CopyRequestHeaders ?? true),
+                OnRequest = tranforms.RequestTransforms.Count == 0 && tranforms.RequestHeaderTransforms.Count == 0 ? null
+                    : (context, request, destination)
+                        => TransformRequestAsync(context, request, destination, tranforms.RequestTransforms, tranforms.RequestHeaderTransforms, tranforms.CopyRequestHeaders ?? true),
+
+                CopyResponseHeaders = tranforms.ResponseHeaderTransforms.Count == 0,
+                OnResponse = tranforms.ResponseHeaderTransforms.Count == 0 ? null
+                    : (context, response) => TransformResponseHeadersAsync(context, response, tranforms.ResponseHeaderTransforms),
+
+                CopyResponseTrailers = tranforms.ResponseTrailerTransforms.Count == 0,
+                OnResponseTrailers = tranforms.ResponseTrailerTransforms.Count == 0 ? null
+                    : (context, response) => TransformResponseTralersAsync(context, response, tranforms.ResponseTrailerTransforms)
+            };
+        }
+
         private void TryCheckTooManyParameters(Action<Exception> onError, IDictionary<string, string> rawTransform, int expected)
         {
             if (rawTransform.Count > expected)
@@ -583,6 +621,181 @@ namespace Microsoft.ReverseProxy.Service.Config
                 path = "/" + path;
             }
             return new PathString(path);
+        }
+
+        private Task TransformRequestAsync(HttpContext context, HttpRequestMessage request, string destinationAddress, IList<RequestParametersTransform> requestTransforms, Dictionary<string, RequestHeaderTransform> requestHeaderTransforms, bool copyRequestHeaders)
+        {
+            var transformContext = new RequestParametersTransformContext()
+            {
+                HttpContext = context,
+                Request = request,
+                Path = context.Request.Path,
+                Query = new QueryTransformContext(context.Request),
+            };
+            foreach (var requestTransform in requestTransforms)
+            {
+                requestTransform.Apply(transformContext);
+            }
+
+            // TODO Perf: We could probably avoid splitting this and just append the final path and query
+            UriHelper.FromAbsolute(destinationAddress, out var destinationScheme, out var destinationHost, out var destinationPathBase, out _, out _); // Query and Fragment are not supported here.
+            var targetUrl = UriHelper.BuildAbsolute(destinationScheme, destinationHost, destinationPathBase, transformContext.Path, transformContext.Query.QueryString);
+            request.RequestUri = new Uri(targetUrl, UriKind.Absolute);
+
+            CopyRequestHeaders(context, request, requestHeaderTransforms, copyRequestHeaders);
+
+            return Task.CompletedTask;
+        }
+
+        private static void CopyRequestHeaders(HttpContext context, HttpRequestMessage destination, Dictionary<string, RequestHeaderTransform> transforms, bool copyRequestHeaders)
+        {
+            // Transforms that were run in the first pass.
+            HashSet<string> transformsRun = null;
+            if (copyRequestHeaders)
+            {
+                foreach (var header in context.Request.Headers)
+                {
+                    var headerName = header.Key;
+                    var headerValue = header.Value;
+                    if (StringValues.IsNullOrEmpty(headerValue))
+                    {
+                        continue;
+                    }
+
+                    // Filter out HTTP/2 pseudo headers like ":method" and ":path", those go into other fields.
+                    if (headerName.Length > 0 && headerName[0] == ':')
+                    {
+                        continue;
+                    }
+
+                    if (transforms.TryGetValue(headerName, out var transform))
+                    {
+                        (transformsRun ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).Add(headerName);
+                        headerValue = transform.Apply(context, headerValue);
+                        if (StringValues.IsNullOrEmpty(headerValue))
+                        {
+                            continue;
+                        }
+                    }
+
+                    AddHeader(destination, headerName, headerValue);
+                }
+            }
+
+            // Run any transforms that weren't run yet.
+            foreach (var (headerName, transform) in transforms)
+            {
+                if (!(transformsRun?.Contains(headerName) ?? false))
+                {
+                    var headerValue = context.Request.Headers[headerName];
+                    headerValue = transform.Apply(context, headerValue);
+                    if (!StringValues.IsNullOrEmpty(headerValue))
+                    {
+                        AddHeader(destination, headerName, headerValue);
+                    }
+                }
+            }
+
+            // Note: HttpClient.SendAsync will end up sending the union of
+            // HttpRequestMessage.Headers and HttpRequestMessage.Content.Headers.
+            // We don't really care where the proxied headers appear among those 2,
+            // as long as they appear in one (and only one, otherwise they would be duplicated).
+            static void AddHeader(HttpRequestMessage request, string headerName, StringValues value)
+            {
+                // HttpClient wrongly uses comma (",") instead of semi-colon (";") as a separator for Cookie headers.
+                // To mitigate this, we concatenate them manually and put them back as a single header value.
+                // A multi-header cookie header is invalid, but we get one because of
+                // https://github.com/dotnet/aspnetcore/issues/26461
+                if (string.Equals(headerName, HeaderNames.Cookie, StringComparison.OrdinalIgnoreCase) && value.Count > 1)
+                {
+                    value = string.Join("; ", value);
+                }
+
+                if (value.Count == 1)
+                {
+                    string headerValue = value;
+                    if (!request.Headers.TryAddWithoutValidation(headerName, headerValue))
+                    {
+                        request.Content?.Headers.TryAddWithoutValidation(headerName, headerValue);
+                    }
+                }
+                else
+                {
+                    string[] headerValues = value;
+                    if (!request.Headers.TryAddWithoutValidation(headerName, headerValues))
+                    {
+                        request.Content?.Headers.TryAddWithoutValidation(headerName, headerValues);
+                    }
+                }
+            }
+        }
+
+        private static Task TransformResponseHeadersAsync(HttpContext context, HttpResponseMessage source, Dictionary<string, ResponseHeaderTransform> transforms)
+        {
+            HashSet<string> transformsRun = null;
+            var responseHeaders = context.Response.Headers;
+            CopyHeaders(source, source.Headers, context, responseHeaders, transforms, ref transformsRun);
+            if (source.Content != null)
+            {
+                CopyHeaders(source, source.Content.Headers, context, responseHeaders, transforms, ref transformsRun);
+            }
+            RunRemainingResponseTransforms(source, context, responseHeaders, transforms, transformsRun);
+            return Task.CompletedTask;
+        }
+
+        private static Task TransformResponseTralersAsync(HttpContext context, HttpResponseMessage source, Dictionary<string, ResponseHeaderTransform> transforms)
+        {
+            // Trailers support was already verified by the caller.
+            var responseTrailersFeature = context.Features.Get<IHttpResponseTrailersFeature>();
+            var outgoingTrailers = responseTrailersFeature?.Trailers;
+            HashSet<string> transformsRun = null;
+            CopyHeaders(source, source.TrailingHeaders, context, outgoingTrailers, transforms, ref transformsRun);
+            RunRemainingResponseTransforms(source, context, outgoingTrailers, transforms, transformsRun);
+            return Task.CompletedTask;
+        }
+
+        private static void CopyHeaders(HttpResponseMessage response, HttpHeaders source, HttpContext context, IHeaderDictionary destination,
+            IReadOnlyDictionary<string, ResponseHeaderTransform> transforms, ref HashSet<string> transformsRun)
+        {
+            foreach (var header in source)
+            {
+                var headerName = header.Key;
+                // TODO: this list only contains "Transfer-Encoding" because that messes up Kestrel. If we don't need to add any more here then it would be more efficient to
+                // check for the single value directly.
+                if (_responseHeadersToSkip.Contains(headerName))
+                {
+                    continue;
+                }
+                var headerValue = new StringValues(header.Value.ToArray());
+
+                if (transforms.TryGetValue(headerName, out var transform))
+                {
+                    (transformsRun ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).Add(headerName);
+                    headerValue = transform.Apply(context, response, headerValue);
+                }
+                if (!StringValues.IsNullOrEmpty(headerValue))
+                {
+                    destination.Append(headerName, headerValue);
+                }
+            }
+        }
+
+        private static void RunRemainingResponseTransforms(HttpResponseMessage response, HttpContext context, IHeaderDictionary destination,
+            IReadOnlyDictionary<string, ResponseHeaderTransform> transforms, HashSet<string> transformsRun)
+        {
+            // Run any transforms that weren't run yet.
+            foreach (var (headerName, transform) in transforms) // TODO: What about multiple transforms per header? Last wins?
+            {
+                if (!(transformsRun?.Contains(headerName) ?? false))
+                {
+                    var headerValue = StringValues.Empty;
+                    headerValue = transform.Apply(context, response, headerValue);
+                    if (!StringValues.IsNullOrEmpty(headerValue))
+                    {
+                        destination.Append(headerName, headerValue);
+                    }
+                }
+            }
         }
     }
 }

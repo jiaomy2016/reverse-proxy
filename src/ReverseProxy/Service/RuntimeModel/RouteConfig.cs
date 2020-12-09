@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using Microsoft.ReverseProxy.Abstractions;
+using Microsoft.ReverseProxy.Service.Proxy;
 using Microsoft.ReverseProxy.Service.RuntimeModel.Transforms;
 
 namespace Microsoft.ReverseProxy.RuntimeModel
@@ -27,7 +28,7 @@ namespace Microsoft.ReverseProxy.RuntimeModel
             ProxyRoute proxyRoute,
             ClusterInfo cluster,
             IReadOnlyList<AspNetCore.Http.Endpoint> aspNetCoreEndpoints,
-            Transforms transforms)
+            HttpTransforms transforms)
         {
             Route = route ?? throw new ArgumentNullException(nameof(route));
             Endpoints = aspNetCoreEndpoints ?? throw new ArgumentNullException(nameof(aspNetCoreEndpoints));
@@ -47,7 +48,7 @@ namespace Microsoft.ReverseProxy.RuntimeModel
 
         public IReadOnlyList<AspNetCore.Http.Endpoint> Endpoints { get; }
 
-        public Transforms Transforms { get; }
+        public HttpTransforms Transforms { get; }
 
         public bool HasConfigChanged(ProxyRoute newConfig, ClusterInfo cluster)
         {

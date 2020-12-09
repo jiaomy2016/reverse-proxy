@@ -9,7 +9,7 @@ namespace Microsoft.ReverseProxy.Service.RuntimeModel.Transforms
     /// <summary>
     /// Transforms for a given route.
     /// </summary>
-    public class Transforms
+    internal class Transforms
     {
         // For tests
         internal static Transforms Empty { get; } = new Transforms(
@@ -22,10 +22,10 @@ namespace Microsoft.ReverseProxy.Service.RuntimeModel.Transforms
         /// <summary>
         /// Creates a new <see cref="Transforms"/> instance.
         /// </summary>
-        public Transforms(bool? copyRequestHeaders, IReadOnlyList<RequestParametersTransform> requestTransforms,
-            IReadOnlyDictionary<string, RequestHeaderTransform> requestHeaderTransforms,
-            IReadOnlyDictionary<string, ResponseHeaderTransform> responseHeaderTransforms,
-            IReadOnlyDictionary<string, ResponseHeaderTransform> responseTrailerTransforms)
+        public Transforms(bool? copyRequestHeaders, IList<RequestParametersTransform> requestTransforms,
+            Dictionary<string, RequestHeaderTransform> requestHeaderTransforms,
+            Dictionary<string, ResponseHeaderTransform> responseHeaderTransforms,
+            Dictionary<string, ResponseHeaderTransform> responseTrailerTransforms)
         {
             CopyRequestHeaders = copyRequestHeaders;
             RequestTransforms = requestTransforms ?? throw new ArgumentNullException(nameof(requestTransforms));
@@ -42,21 +42,21 @@ namespace Microsoft.ReverseProxy.Service.RuntimeModel.Transforms
         /// <summary>
         /// Request parameter transforms.
         /// </summary>
-        public IReadOnlyList<RequestParametersTransform> RequestTransforms { get; }
+        public IList<RequestParametersTransform> RequestTransforms { get; }
 
         /// <summary>
         /// Request header transforms.
         /// </summary>
-        public IReadOnlyDictionary<string, RequestHeaderTransform> RequestHeaderTransforms { get; }
+        public Dictionary<string, RequestHeaderTransform> RequestHeaderTransforms { get; }
 
         /// <summary>
         /// Response header transforms.
         /// </summary>
-        public IReadOnlyDictionary<string, ResponseHeaderTransform> ResponseHeaderTransforms { get; }
+        public Dictionary<string, ResponseHeaderTransform> ResponseHeaderTransforms { get; }
 
         /// <summary>
         /// Response trailer transforms.
         /// </summary>
-        public IReadOnlyDictionary<string, ResponseHeaderTransform> ResponseTrailerTransforms { get; }
+        public Dictionary<string, ResponseHeaderTransform> ResponseTrailerTransforms { get; }
     }
 }
